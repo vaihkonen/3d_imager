@@ -14,6 +14,69 @@ class BaslerCamera:
         # Setup logging
         self.logger = logging.getLogger(__name__)
 
+    def _safe_set_parameter(self, param_names, value, description=""):
+        """
+        Safely set a camera parameter, trying multiple parameter names if necessary.
+        
+        Args:
+            param_names: String or list of parameter names to try
+            value: Value to set
+            description: Description for logging
+            
+        Returns:
+            tuple: (success, parameter_name_used)
+        """
+        if isinstance(param_names, str):
+            param_names = [param_names]
+            
+        for param_name in param_names:
+            try:
+                if hasattr(self.camera, param_name):
+                    param = getattr(self.camera, param_name)
+                    # Check if parameter is writable (use property, not method)
+                    if hasattr(param, 'IsWritable') and param.IsWritable:
+                        param.SetValue(value)
+                        return True, param_name
+                    else:
+                        self.logger.debug(f"Parameter {param_name} exists but is not writable")
+                else:
+                    self.logger.debug(f"Parameter {param_name} does not exist on this camera model")
+            except Exception as e:
+                self.logger.debug(f"Failed to set {param_name}: {str(e)}")
+                continue
+                
+        return False, None
+
+    def _configure_optional_parameters(self):
+        """Configure optional parameters that may not be available on all camera models"""
+        optional_configs = []
+        
+        # Try to set frame rate if supported
+        success, param_used = self._safe_set_parameter(['AcquisitionFrameRateEnable'], True)
+        if success:
+            success2, param_used2 = self._safe_set_parameter(['AcquisitionFrameRate', 'AcquisitionFrameRateAbs'], 30.0)
+            if success2:
+                optional_configs.append(f"FrameRate ({param_used2})")
+        
+        # Try to set width and height if supported
+        success, param_used = self._safe_set_parameter(['Width'], 1920)
+        if success:
+            optional_configs.append(f"Width ({param_used})")
+            
+        success, param_used = self._safe_set_parameter(['Height'], 1080)
+        if success:
+            optional_configs.append(f"Height ({param_used})")
+        
+        # Try to enable auto white balance if available
+        success, param_used = self._safe_set_parameter(['BalanceWhiteAuto'], 'Continuous')
+        if success:
+            optional_configs.append(f"BalanceWhiteAuto ({param_used})")
+        
+        if optional_configs:
+            self.logger.info(f"Optional parameters configured: {', '.join(optional_configs)}")
+        
+        return optional_configs
+
     def discover_cameras(self):
         """Discover all available Basler cameras on the network"""
         try:
@@ -116,30 +179,72 @@ class BaslerCamera:
 
     def _configure_camera(self):
         """Configure camera parameters for stereo vision"""
+        configured_params = []
+        failed_params = []
+        
         try:
             # Enable free-running mode
-            self.camera.AcquisitionMode.SetValue('Continuous')
+            success, param_used = self._safe_set_parameter('AcquisitionMode', 'Continuous')
+            if success:
+                configured_params.append(f"AcquisitionMode ({param_used})")
+            else:
+                failed_params.append("AcquisitionMode (not available or not writable)")
             
-            # Set exposure time (adjust as needed)
-            if self.camera.ExposureTime.IsWritable():
-                self.camera.ExposureTime.SetValue(10000)  # 10ms
+            # Set exposure time (try different parameter names for different camera models)
+            success, param_used = self._safe_set_parameter(['ExposureTime', 'ExposureTimeAbs'], 10000)
+            if success:
+                configured_params.append(f"ExposureTime ({param_used})")
+            else:
+                failed_params.append("ExposureTime (not available or not writable)")
             
-            # Set gain (adjust as needed)
-            if self.camera.Gain.IsWritable():
-                self.camera.Gain.SetValue(1.0)
+            # Set gain (try different parameter names for different camera models)
+            success, param_used = self._safe_set_parameter(['Gain'], 1.0)
+            if not success:
+                success, param_used = self._safe_set_parameter(['GainRaw'], 100)
             
-            # Set pixel format to RGB8 if available
-            if self.camera.PixelFormat.IsWritable():
-                available_formats = self.camera.PixelFormat.Symbolics
-                if 'RGB8' in available_formats:
-                    self.camera.PixelFormat.SetValue('RGB8')
-                elif 'BayerRG8' in available_formats:
-                    self.camera.PixelFormat.SetValue('BayerRG8')
+            if success:
+                configured_params.append(f"Gain ({param_used})")
+            else:
+                failed_params.append("Gain (not available or not writable)")
+            
+            # Set pixel format to the best available option
+            pixel_format_set = False
+            try:
+                if hasattr(self.camera, 'PixelFormat') and hasattr(self.camera.PixelFormat, 'IsWritable') and self.camera.PixelFormat.IsWritable:
+                    available_formats = list(self.camera.PixelFormat.Symbolics)
+                    format_priority = ['RGB8', 'BayerRG8', 'BayerGB8', 'BayerGR8', 'BayerBG8', 'Mono8']
                     
-            self.logger.info("Camera parameters configured")
+                    for fmt in format_priority:
+                        if fmt in available_formats:
+                            try:
+                                self.camera.PixelFormat.SetValue(fmt)
+                                configured_params.append(f"PixelFormat ({fmt})")
+                                pixel_format_set = True
+                                break
+                            except Exception as e:
+                                self.logger.debug(f"Failed to set PixelFormat to {fmt}: {str(e)}")
+                                continue
+                    
+                    if not pixel_format_set:
+                        failed_params.append("PixelFormat (no suitable format could be set)")
+                else:
+                    failed_params.append("PixelFormat (not available or not writable)")
+            except Exception as e:
+                self.logger.debug(f"Error accessing PixelFormat: {str(e)}")
+                failed_params.append("PixelFormat (error accessing parameter)")
             
+            # Log results
+            if configured_params:
+                self.logger.info(f"Essential camera parameters configured: {', '.join(configured_params)}")
+            
+            if failed_params:
+                self.logger.debug(f"Camera parameters not set: {', '.join(failed_params)}")
+            
+            # Configure optional parameters
+            self._configure_optional_parameters()
+                
         except Exception as e:
-            self.logger.warning(f"Some camera parameters could not be set: {str(e)}")
+            self.logger.warning(f"Error during camera configuration: {str(e)}")
 
     def start_grabbing(self):
         """Start continuous image acquisition"""
@@ -163,8 +268,65 @@ class BaslerCamera:
         except Exception as e:
             self.logger.error(f"Failed to stop grabbing: {str(e)}")
 
-    def capture_frame(self, timeout_ms=5000):
-        """Capture a single frame from the camera"""
+    def capture_frame(self, timeout_ms=5000, max_retries=2):
+        """Capture a single frame from the camera with retry logic for reliability"""
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                if not self.camera or not self.camera.IsOpen():
+                    self.logger.error("Camera not initialized or opened")
+                    return None
+                
+                # For stereo vision, use single frame acquisition instead of continuous
+                # This prevents conflicts when multiple cameras are capturing simultaneously
+                if self.is_grabbing:
+                    self.stop_grabbing()
+                
+                # Add small delay if this is a retry to let camera settle
+                if retry_count > 0:
+                    import time
+                    time.sleep(0.1)
+                
+                # Use single frame grab strategy
+                grabResult = self.camera.GrabOne(timeout_ms)
+                
+                if grabResult.GrabSucceeded():
+                    # Convert the image to BGR format
+                    image = self.converter.Convert(grabResult)
+                    img_array = image.GetArray()
+                    
+                    # Release the grab result
+                    grabResult.Release()
+                    
+                    if retry_count > 0:
+                        self.logger.debug(f"Frame capture succeeded on retry {retry_count}")
+                    
+                    return img_array
+                else:
+                    # Don't log error on first attempt, only on retries
+                    if retry_count == max_retries:
+                        self.logger.error("Single frame grab failed after all retries")
+                    else:
+                        self.logger.debug(f"Frame grab attempt {retry_count + 1} failed, retrying...")
+                    
+                    grabResult.Release()
+                    retry_count += 1
+                    continue
+                    
+            except Exception as e:
+                if retry_count == max_retries:
+                    self.logger.error(f"Failed to capture frame after {max_retries + 1} attempts: {str(e)}")
+                else:
+                    self.logger.debug(f"Capture attempt {retry_count + 1} failed: {str(e)}, retrying...")
+                
+                retry_count += 1
+                continue
+        
+        return None
+
+    def capture_frame_continuous(self, timeout_ms=5000):
+        """Capture a frame using continuous grabbing mode (use with caution in multi-camera setups)"""
         try:
             if not self.camera or not self.camera.IsOpen():
                 self.logger.error("Camera not initialized or opened")
@@ -192,8 +354,31 @@ class BaslerCamera:
                 return None
                 
         except Exception as e:
-            self.logger.error(f"Failed to capture frame: {str(e)}")
+            self.logger.error(f"Failed to capture frame in continuous mode: {str(e)}")
             return None
+
+    @staticmethod
+    def capture_stereo_frames(camera_left, camera_right, timeout_ms=5000):
+        """
+        Capture frames from both cameras in sequence for stereo vision.
+        Sequential capture is more reliable than simultaneous capture for most setups.
+        Returns tuple (left_frame, right_frame) where either can be None if capture failed.
+        """
+        import time
+        
+        # Capture left frame first
+        start_time = time.time()
+        left_frame = camera_left.capture_frame(timeout_ms)
+        
+        # Capture right frame immediately after
+        right_frame = camera_right.capture_frame(timeout_ms)
+        
+        capture_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+        
+        if left_frame is not None and right_frame is not None:
+            camera_left.logger.debug(f"Stereo capture completed in {capture_time:.1f}ms")
+        
+        return left_frame, right_frame
 
     def get_camera_info(self):
         """Get camera information"""

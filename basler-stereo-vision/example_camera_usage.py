@@ -87,9 +87,10 @@ def main():
             
             # Check if it's time to capture a new frame
             if current_time - last_capture_time >= capture_interval:
-                # Capture frames from both cameras simultaneously
-                frame_left = camera_left.capture_frame()
-                frame_right = camera_right.capture_frame()
+                # Capture frames from both cameras using the improved stereo method
+                frame_left, frame_right = BaslerCamera.capture_stereo_frames(
+                    camera_left, camera_right, timeout_ms=3000
+                )
                 
                 if frame_left is not None and frame_right is not None:
                     frame_count += 1
