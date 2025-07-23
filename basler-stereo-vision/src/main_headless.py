@@ -9,7 +9,7 @@ import cv2
 import os
 import numpy as np
 from camera.basler_camera import BaslerCamera
-from stereo.depth_estimation import estimate_depth
+from stereo.depth_estimation import estimate_depth, estimate_depth_sgbm
 from utils.image_processing import preprocess_image
 
 def main():
@@ -77,25 +77,40 @@ def main():
         print(f"  Processed frame 1: {processed_frame1.shape}")
         print(f"  Processed frame 2: {processed_frame2.shape}")
 
-        # Estimate depth
-        print("\\nComputing depth map...")
-        disparity_map, points_3d = estimate_depth(processed_frame1, processed_frame2)
+        # Estimate depth using both methods for comparison
+        print("\\nComputing depth map using Block Matching...")
+        disparity_bm, points_3d_bm = estimate_depth(processed_frame1, processed_frame2, debug=True)
         
-        print(f"Depth computation completed:")
-        print(f"  Disparity map shape: {disparity_map.shape}")
-        print(f"  Disparity map range: {np.min(disparity_map):.1f} to {np.max(disparity_map):.1f}")
-        print(f"  3D points shape: {points_3d.shape}")
+        print("\\nComputing depth map using SGBM...")
+        disparity_sgbm, points_3d_sgbm = estimate_depth_sgbm(processed_frame1, processed_frame2, debug=True)
+        
+        print(f"\\nDepth computation completed:")
+        print(f"  BM Disparity map: {disparity_bm.shape}, range: {np.min(disparity_bm):.1f} to {np.max(disparity_bm):.1f}")
+        print(f"  SGBM Disparity map: {disparity_sgbm.shape}, range: {np.min(disparity_sgbm):.1f} to {np.max(disparity_sgbm):.1f}")
 
         # Save output images for verification
         print("\\nSaving output images...")
         cv2.imwrite('output_frame1.jpg', frame1)
         cv2.imwrite('output_frame2.jpg', frame2) 
-        cv2.imwrite('output_disparity.jpg', disparity_map.astype('uint8'))
+        
+        # Save both disparity maps
+        cv2.imwrite('output_disparity_bm.jpg', disparity_bm)
+        cv2.imwrite('output_disparity_sgbm.jpg', disparity_sgbm)
+        
+        # Also save colored versions for better visualization
+        disparity_bm_colored = cv2.applyColorMap(disparity_bm, cv2.COLORMAP_JET)
+        disparity_sgbm_colored = cv2.applyColorMap(disparity_sgbm, cv2.COLORMAP_JET)
+        cv2.imwrite('output_disparity_bm_colored.jpg', disparity_bm_colored)
+        cv2.imwrite('output_disparity_sgbm_colored.jpg', disparity_sgbm_colored)
         
         print("Images saved:")
         print("  output_frame1.jpg - Raw left camera frame")
         print("  output_frame2.jpg - Raw right camera frame")
-        print("  output_disparity.jpg - Computed disparity map")
+        print("  output_disparity_bm.jpg - Block Matching disparity (grayscale)")
+        print("  output_disparity_sgbm.jpg - SGBM disparity (grayscale)")
+        print("  output_disparity_bm_colored.jpg - Block Matching disparity (colored)")
+        print("  output_disparity_sgbm_colored.jpg - SGBM disparity (colored)")
+        print("\\n  Compare the different methods to see which works better for your setup!")
         
         print("\\n🎉 STEREO VISION PIPELINE COMPLETED SUCCESSFULLY!")
         
