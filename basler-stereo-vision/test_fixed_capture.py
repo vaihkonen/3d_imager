@@ -20,6 +20,10 @@ def main():
     
     print("=== TESTING FIXED BASLER STEREO CAMERA CAPTURE ===")
     
+    # Create output directory for test images
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    
     # First, list all available cameras
     print("Scanning for available Basler cameras...")
     available_cameras = BaslerCamera.list_available_cameras()
@@ -79,10 +83,10 @@ def main():
                 print(f"  Left frame: {frame_left.shape}")
                 print(f"  Right frame: {frame_right.shape}")
                 
-                # Save frames for verification (optional)
+                # Save frames for verification (optional) - now saves to output folder
                 # import cv2
-                # cv2.imwrite(f"test_left_{i+1}.jpg", frame_left)
-                # cv2.imwrite(f"test_right_{i+1}.jpg", frame_right)
+                # cv2.imwrite(os.path.join(output_dir, f"test_left_{i+1}.jpg"), frame_left)
+                # cv2.imwrite(os.path.join(output_dir, f"test_right_{i+1}.jpg"), frame_right)
                 
             else:
                 print(f"✗ FAILED to capture frame pair {i+1}")

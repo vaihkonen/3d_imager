@@ -18,6 +18,11 @@ def main():
     # Setup logging
     logging.basicConfig(level=logging.INFO)
     
+    # Create output directory for captured images
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Images will be saved to: {os.path.abspath(output_dir)}")
+    
     # First, list all available cameras
     print("Scanning for available Basler cameras...")
     available_cameras = BaslerCamera.list_available_cameras()
@@ -103,15 +108,18 @@ def main():
                     cv2.imshow('Left Camera Feed', frame_left)
                     cv2.imshow('Right Camera Feed', frame_right)
                     
-                    # Save frames with timestamp
+                    # Save frames with timestamp to output folder
                     filename_left = f"frame_left_{frame_count}_{int(current_time)}.jpg"
                     filename_right = f"frame_right_{frame_count}_{int(current_time)}.jpg"
                     
-                    cv2.imwrite(filename_left, frame_left)
-                    cv2.imwrite(filename_right, frame_right)
+                    filepath_left = os.path.join(output_dir, filename_left)
+                    filepath_right = os.path.join(output_dir, filename_right)
                     
-                    print(f"  Saved left frame as: {filename_left}")
-                    print(f"  Saved right frame as: {filename_right}")
+                    cv2.imwrite(filepath_left, frame_left)
+                    cv2.imwrite(filepath_right, frame_right)
+                    
+                    print(f"  Saved left frame as: {filepath_left}")
+                    print(f"  Saved right frame as: {filepath_right}")
                     
                     last_capture_time = current_time
                     
