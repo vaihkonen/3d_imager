@@ -14,37 +14,73 @@ class BaslerCamera:
         # Setup logging
         self.logger = logging.getLogger(__name__)
 
-    def _safe_set_parameter(self, param_names, value, description=""):
+    def _safe_set_parameter(self, param_names, value, description="", retries=3):
         """
         Safely set a camera parameter, trying multiple parameter names if necessary.
-        
+        Uses NodeMap API for reliable parameter access.
+
         Args:
             param_names: String or list of parameter names to try
             value: Value to set
             description: Description for logging
-            
+            retries: Number of times to retry setting the parameter
+
         Returns:
             tuple: (success, parameter_name_used)
         """
+        from pypylon import genicam
+        import time
+
         if isinstance(param_names, str):
             param_names = [param_names]
             
         for param_name in param_names:
-            try:
-                if hasattr(self.camera, param_name):
-                    param = getattr(self.camera, param_name)
-                    # Check if parameter is writable (use property, not method)
-                    if hasattr(param, 'IsWritable') and param.IsWritable:
-                        param.SetValue(value)
-                        return True, param_name
+            for attempt in range(retries):
+                try:
+                    # Use NodeMap API for reliable parameter access
+                    node_map = self.camera.GetNodeMap()
+                    param = node_map.GetNode(param_name)
+
+                    if param is not None:
+                        # Check if parameter is writable
+                        access_mode = param.GetAccessMode()
+                        is_writable = access_mode == genicam.RW or access_mode == genicam.WO
+
+                        if is_writable:
+                            # Set value based on parameter type
+                            param.SetValue(value)
+
+                            # Verify it was set (for critical parameters)
+                            if hasattr(param, 'GetValue'):
+                                try:
+                                    actual_value = param.GetValue()
+                                    if actual_value == value or abs(actual_value - value) < 1:
+                                        self.logger.debug(f"Successfully set {param_name} = {value}")
+                                        return True, param_name
+                                except:
+                                    # If we can't verify, assume success
+                                    pass
+
+                            self.logger.debug(f"Set {param_name} = {value}")
+                            return True, param_name
+                        else:
+                            if attempt == 0:  # Only log once
+                                self.logger.debug(f"Parameter {param_name} exists but is not writable (access_mode={access_mode})")
+                            break  # Don't retry if not writable
                     else:
-                        self.logger.debug(f"Parameter {param_name} exists but is not writable")
-                else:
-                    self.logger.debug(f"Parameter {param_name} does not exist on this camera model")
-            except Exception as e:
-                self.logger.debug(f"Failed to set {param_name}: {str(e)}")
-                continue
-                
+                        if attempt == 0:  # Only log once
+                            self.logger.debug(f"Parameter {param_name} does not exist")
+                        break  # Don't retry if doesn't exist
+
+                except Exception as e:
+                    if attempt < retries - 1:
+                        self.logger.debug(f"Failed to set {param_name} (attempt {attempt+1}/{retries}): {str(e)}")
+                        time.sleep(0.1)  # Small delay before retry
+                        continue
+                    else:
+                        self.logger.debug(f"Failed to set {param_name} after {retries} attempts: {str(e)}")
+                        break
+
         return False, None
 
     def _configure_optional_parameters(self):
@@ -155,13 +191,29 @@ class BaslerCamera:
             # Create camera instance
             self.camera = pylon.InstantCamera(tlFactory.CreateDevice(selected_camera))
             
+            # CRITICAL: Set buffer count BEFORE opening camera
+            # High-resolution GigE cameras need more buffers to prevent underruns
+            # Default is 5, we use 15 for 12MP cameras
+            self.camera.MaxNumBuffer = 15
+
             # Open the camera
             self.camera.Open()
             
+            # IMPORTANT: Stop any ongoing grabbing first (camera might be in invalid state)
+            if self.camera.IsGrabbing():
+                self.logger.warning("Camera was already grabbing, stopping first...")
+                self.camera.StopGrabbing()
+                self.is_grabbing = False
+
             # Get actual IP address after connection
             if not self.camera_ip and hasattr(selected_camera, 'GetIpAddress'):
                 self.camera_ip = selected_camera.GetIpAddress()
             
+            # CRITICAL: Many camera parameters require acquisition to be stopped
+            # Ensure camera is in correct state before configuration
+            if self.camera.IsGrabbing():
+                self.camera.StopGrabbing()
+
             # Set camera parameters for optimal performance
             self._configure_camera()
             
@@ -171,6 +223,7 @@ class BaslerCamera:
             self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
             
             self.logger.info(f"Basler camera initialized successfully at IP: {self.camera_ip}")
+            self.logger.info(f"Camera buffer count set to: {self.camera.MaxNumBuffer.Value}")
             return True
             
         except Exception as e:
@@ -183,63 +236,111 @@ class BaslerCamera:
         failed_params = []
         
         try:
-            # Enable free-running mode
+            # ===== CRITICAL GigE NETWORK PARAMETERS (Must configure FIRST) =====
+            # These parameters prevent "buffer incompletely grabbed" errors
+
+            # For GigE cameras, we need to access the StreamGrabber parameters
+            # These control the network transport layer
+            try:
+                # Get the stream grabber parameters (for GigE cameras)
+                if hasattr(self.camera, 'StreamGrabber'):
+                    stream_grabber = self.camera.StreamGrabber
+
+                    # MaxNumBuffer - increase buffer count
+                    if hasattr(stream_grabber, 'MaxNumBuffer'):
+                        try:
+                            stream_grabber.MaxNumBuffer.SetValue(10)
+                            configured_params.append("StreamGrabber.MaxNumBuffer=10")
+                        except Exception as e:
+                            self.logger.debug(f"Could not set MaxNumBuffer: {e}")
+
+                    # MaxBufferSize - increase buffer size for high-res cameras
+                    if hasattr(stream_grabber, 'MaxBufferSize'):
+                        try:
+                            # For 12MP camera: 4024x3036x3 = ~36MB per frame
+                            stream_grabber.MaxBufferSize.SetValue(40000000)  # 40MB
+                            configured_params.append("StreamGrabber.MaxBufferSize=40MB")
+                        except Exception as e:
+                            self.logger.debug(f"Could not set MaxBufferSize: {e}")
+            except Exception as e:
+                self.logger.debug(f"Could not access StreamGrabber parameters: {e}")
+
+            # 1. Packet Size - CRITICAL: Reduce from default 9000 to standard MTU
+            # Jumbo frames (9000) can cause packet loss if network isn't configured for it
+            success, param_used = self._safe_set_parameter(['GevSCPSPacketSize'], 1500)
+            if success:
+                configured_params.append(f"PacketSize=1500 (reduced from jumbo)")
+            else:
+                self.logger.warning("Failed to set GevSCPSPacketSize - this is CRITICAL for reliability!")
+
+            # 2. Inter-Packet Delay - CRITICAL for preventing packet loss with high-res cameras
+            # Default is 0, we need significant delay for 12MP cameras
+            # Higher delay = more time between packets = less congestion
+            # For acA4024-8gc (12MP), we need substantial delay due to large frame size
+            success, param_used = self._safe_set_parameter(['GevSCPD'], 20000)
+            if success:
+                configured_params.append(f"InterPacketDelay=20000us (CRITICAL)")
+            else:
+                self.logger.warning("Failed to set GevSCPD (Inter-Packet Delay) - this is CRITICAL!")
+
+            # 3. Frame Transmission Delay
+            success, param_used = self._safe_set_parameter(['GevSCFTD'], 0)
+            if success:
+                configured_params.append(f"FrameTransmissionDelay=0")
+
+            # 4. Heartbeat Timeout
+            success, param_used = self._safe_set_parameter(['GevHeartbeatTimeout'], 30000)
+            if success:
+                configured_params.append(f"HeartbeatTimeout=30000ms ({param_used})")
+
+            # ===== ACQUISITION PARAMETERS =====
+
+            # Enable free-running mode (no trigger)
             success, param_used = self._safe_set_parameter('AcquisitionMode', 'Continuous')
             if success:
-                configured_params.append(f"AcquisitionMode ({param_used})")
-            else:
-                failed_params.append("AcquisitionMode (not available or not writable)")
-            
-            # Set exposure time (try different parameter names for different camera models)
+                configured_params.append(f"AcquisitionMode=Continuous ({param_used})")
+
+            # Set exposure time
             success, param_used = self._safe_set_parameter(['ExposureTime', 'ExposureTimeAbs'], 10000)
             if success:
-                configured_params.append(f"ExposureTime ({param_used})")
-            else:
-                failed_params.append("ExposureTime (not available or not writable)")
-            
-            # Set gain (try different parameter names for different camera models)
+                configured_params.append(f"ExposureTime=10000us ({param_used})")
+
+            # Set gain
             success, param_used = self._safe_set_parameter(['Gain'], 1.0)
             if not success:
                 success, param_used = self._safe_set_parameter(['GainRaw'], 100)
             
             if success:
                 configured_params.append(f"Gain ({param_used})")
-            else:
-                failed_params.append("Gain (not available or not writable)")
-            
+
             # Set pixel format to the best available option
             pixel_format_set = False
             try:
-                if hasattr(self.camera, 'PixelFormat') and hasattr(self.camera.PixelFormat, 'IsWritable') and self.camera.PixelFormat.IsWritable:
-                    available_formats = list(self.camera.PixelFormat.Symbolics)
-                    format_priority = ['RGB8', 'BayerRG8', 'BayerGB8', 'BayerGR8', 'BayerBG8', 'Mono8']
-                    
-                    for fmt in format_priority:
-                        if fmt in available_formats:
-                            try:
-                                self.camera.PixelFormat.SetValue(fmt)
-                                configured_params.append(f"PixelFormat ({fmt})")
-                                pixel_format_set = True
-                                break
-                            except Exception as e:
-                                self.logger.debug(f"Failed to set PixelFormat to {fmt}: {str(e)}")
-                                continue
-                    
-                    if not pixel_format_set:
-                        failed_params.append("PixelFormat (no suitable format could be set)")
-                else:
-                    failed_params.append("PixelFormat (not available or not writable)")
+                if hasattr(self.camera, 'PixelFormat'):
+                    param = self.camera.PixelFormat
+                    if hasattr(param, 'IsWritable') and param.IsWritable:
+                        available_formats = list(param.Symbolics)
+                        format_priority = ['RGB8', 'BayerRG8', 'BayerGB8', 'BayerGR8', 'BayerBG8', 'Mono8']
+
+                        for fmt in format_priority:
+                            if fmt in available_formats:
+                                try:
+                                    param.SetValue(fmt)
+                                    configured_params.append(f"PixelFormat={fmt}")
+                                    pixel_format_set = True
+                                    break
+                                except Exception as e:
+                                    self.logger.debug(f"Failed to set PixelFormat to {fmt}: {str(e)}")
+                                    continue
             except Exception as e:
                 self.logger.debug(f"Error accessing PixelFormat: {str(e)}")
-                failed_params.append("PixelFormat (error accessing parameter)")
-            
+
             # Log results
             if configured_params:
-                self.logger.info(f"Essential camera parameters configured: {', '.join(configured_params)}")
-            
-            if failed_params:
-                self.logger.debug(f"Camera parameters not set: {', '.join(failed_params)}")
-            
+                self.logger.info(f"Camera parameters configured: {', '.join(configured_params)}")
+            else:
+                self.logger.warning("No camera parameters were successfully configured!")
+
             # Configure optional parameters
             self._configure_optional_parameters()
                 
@@ -268,8 +369,13 @@ class BaslerCamera:
         except Exception as e:
             self.logger.error(f"Failed to stop grabbing: {str(e)}")
 
-    def capture_frame(self, timeout_ms=5000, max_retries=2):
-        """Capture a single frame from the camera with retry logic for reliability"""
+    def capture_frame(self, timeout_ms=15000, max_retries=2):
+        """Capture a single frame from the camera with retry logic for reliability
+
+        Args:
+            timeout_ms: Timeout in milliseconds (default 15000 for high-res GigE cameras - 12MP takes time!)
+            max_retries: Maximum number of retry attempts
+        """
         retry_count = 0
         
         while retry_count <= max_retries:
@@ -278,17 +384,24 @@ class BaslerCamera:
                     self.logger.error("Camera not initialized or opened")
                     return None
                 
-                # For stereo vision, use single frame acquisition instead of continuous
-                # This prevents conflicts when multiple cameras are capturing simultaneously
-                if self.is_grabbing:
-                    self.stop_grabbing()
-                
+                # IMPORTANT: Stop grabbing if it's running - GrabOne() handles its own acquisition
+                # The "device physically removed" error often happens when grabbing state is inconsistent
+                if self.is_grabbing or self.camera.IsGrabbing():
+                    try:
+                        self.camera.StopGrabbing()
+                        self.is_grabbing = False
+                        self.logger.debug("Stopped continuous grabbing before GrabOne")
+                    except Exception as e:
+                        self.logger.debug(f"Error stopping grab (continuing): {e}")
+
                 # Add small delay if this is a retry to let camera settle
                 if retry_count > 0:
                     import time
-                    time.sleep(0.1)
-                
-                # Use single frame grab strategy
+                    time.sleep(0.2)
+                    self.logger.debug(f"Retry attempt {retry_count}")
+
+                # GrabOne internally starts and stops grabbing for a single frame
+                # This is the recommended way for multi-camera setups
                 grabResult = self.camera.GrabOne(timeout_ms)
                 
                 if grabResult.GrabSucceeded():
@@ -300,26 +413,36 @@ class BaslerCamera:
                     grabResult.Release()
                     
                     if retry_count > 0:
-                        self.logger.debug(f"Frame capture succeeded on retry {retry_count}")
-                    
+                        self.logger.info(f"Frame capture succeeded on retry {retry_count}")
+
                     return img_array
                 else:
-                    # Don't log error on first attempt, only on retries
+                    # Log the actual error from grab result
+                    error_code = grabResult.GetErrorCode() if hasattr(grabResult, 'GetErrorCode') else 'Unknown'
+                    error_desc = grabResult.GetErrorDescription() if hasattr(grabResult, 'GetErrorDescription') else 'No description'
+
+                    grabResult.Release()
+
                     if retry_count == max_retries:
-                        self.logger.error("Single frame grab failed after all retries")
+                        self.logger.error(f"Frame grab failed after all retries. Error: {error_code} - {error_desc}")
                     else:
                         self.logger.debug(f"Frame grab attempt {retry_count + 1} failed, retrying...")
-                    
-                    grabResult.Release()
+
                     retry_count += 1
                     continue
                     
             except Exception as e:
+                error_msg = str(e)
+
                 if retry_count == max_retries:
-                    self.logger.error(f"Failed to capture frame after {max_retries + 1} attempts: {str(e)}")
+                    self.logger.error(f"Failed to capture frame after {max_retries + 1} attempts: {error_msg}")
+                    self.logger.error("Possible causes:")
+                    self.logger.error("  - Camera in invalid state")
+                    self.logger.error("  - Trigger mode enabled (should be off)")
+                    self.logger.error("  - Camera hardware issue")
                 else:
-                    self.logger.debug(f"Capture attempt {retry_count + 1} failed: {str(e)}, retrying...")
-                
+                    self.logger.debug(f"Capture attempt {retry_count + 1} failed: {error_msg}")
+
                 retry_count += 1
                 continue
         
